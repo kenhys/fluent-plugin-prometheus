@@ -266,6 +266,38 @@ You can access nested keys in records via dot or bracket notation (https://docs.
 
 See Supported Metric Type and Labels for more configuration parameters.
 
+#### Limiting label expansion
+
+Label values come from records, so a metric can grow unboundedly when a label
+is bound to a field with many distinct values. Both plugins limit it:
+
+|parameter|description|default|
+|---|---|---|
+|max_label_value_length|The maximum length of a label value. A longer value is truncated. `0` means unlimited.|256|
+|max_series_per_metric|The maximum number of label sets a metric can hold. A label set beyond the limit is dropped, while the label sets already known keep being instrumented. `0` means unlimited.|10000|
+|ignore_error_log_interval|The interval in seconds to suppress the repeated warning about the dropped label sets. `0` logs every occurrence.|3600|
+
+```
+<filter message>
+  @type prometheus
+  max_label_value_length 128
+  max_series_per_metric 1000
+  <metric>
+    name message_foo_counter
+    type counter
+    desc The total number of foo in message.
+    key foo
+    <labels>
+      path $.kubernetes.pod_name
+    </labels>
+  </metric>
+</filter>
+```
+
+Note that the number of label sets is counted per metric of each plugin
+instance. When two plugin instances instrument the same metric name, each of
+them has its own limit.
+
 ## Supported Metric Types
 
 For details of each metric type, see [Prometheus documentation](http://prometheus.io/docs/concepts/metric_types/). Also see [metric name guide](http://prometheus.io/docs/practices/naming/).
