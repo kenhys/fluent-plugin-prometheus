@@ -361,6 +361,17 @@ module Fluent
           label
         end
 
+        # Instruments a record through the given block and counts its label set
+        # as a series only after the block succeeded. A record which fails to be
+        # instrumented (e.g. its value is not a number) must not consume
+        # max_series_per_metric, otherwise such records could exhaust the limit
+        # and make the following valid label sets dropped.
+        def with_label_set(record, expander)
+          label = labels(record, expander)
+          yield label
+          remember_series(label)
+        end
+
         def self.get(registry, name, type, docstring)
           metric = registry.get(name)
 
@@ -404,6 +415,8 @@ module Fluent
 
         # Keeps the cardinality of a metric bounded. Once the limit is reached,
         # the already known label sets keep working and only a new one is refused.
+        # The label set is not counted here but by #remember_series, so that a
+        # failed instrumentation does not consume the limit.
         def check_series_limit!(label)
           return if @max_series_per_metric <= 0
 
@@ -414,6 +427,18 @@ module Fluent
               # the message must not contain the label set, it comes from a record
               raise LabelSetLimitError, "#{@name} reached max_series_per_metric (#{@max_series_per_metric})"
             end
+          end
+        end
+
+        def remember_series(label)
+          return if @max_series_per_metric <= 0
+
+          @series_mutex.synchronize do
+            next if @series.key?(label)
+            # a concurrent instrumentation may have filled the limit after
+            # check_series_limit! passed. The label set is already instrumented,
+            # but it is not counted so that the limit is never exceeded.
+            next if @series.size >= @max_series_per_metric
 
             @series[label] = true
           end
@@ -445,7 +470,9 @@ module Fluent
             value = @key.call(record)
           end
           if value
-            @gauge.set(value, labels: labels(record, expander))
+            with_label_set(record, expander) do |label|
+              @gauge.set(value, labels: label)
+            end
           end
         end
       end
@@ -477,7 +504,9 @@ module Fluent
           # ignore if record value is nil
           return if value.nil?
 
-          @counter.increment(by: value, labels: labels(record, expander))
+          with_label_set(record, expander) do |label|
+            @counter.increment(by: value, labels: label)
+          end
         end
       end
 
@@ -506,7 +535,9 @@ module Fluent
             value = @key.call(record)
           end
           if value
-            @summary.observe(value, labels: labels(record, expander))
+            with_label_set(record, expander) do |label|
+              @summary.observe(value, labels: label)
+            end
           end
         end
       end
@@ -543,7 +574,9 @@ module Fluent
             value = @key.call(record)
           end
           if value
-            @histogram.observe(value, labels: labels(record, expander))
+            with_label_set(record, expander) do |label|
+              @histogram.observe(value, labels: label)
+            end
           end
         end
       end

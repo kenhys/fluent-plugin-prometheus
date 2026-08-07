@@ -298,6 +298,10 @@ Note that the number of label sets is counted per metric of each plugin
 instance. When two plugin instances instrument the same metric name, each of
 them has its own limit.
 
+A label set is counted only after the metric was instrumented successfully. A
+record which fails to be instrumented, for example when the value of `key` is
+not a number, does not consume `max_series_per_metric`.
+
 ## Supported Metric Types
 
 For details of each metric type, see [Prometheus documentation](http://prometheus.io/docs/concepts/metric_types/). Also see [metric name guide](http://prometheus.io/docs/practices/naming/).

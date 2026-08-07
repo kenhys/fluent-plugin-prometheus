@@ -46,6 +46,61 @@ describe Fluent::Plugin::PrometheusFilter do
     it_behaves_like 'instruments record'
   end
 
+  describe 'max_series_per_metric' do
+    let(:config) {
+      BASE_CONFIG + %[
+        max_series_per_metric 1
+        <metric>
+          name limited
+          type counter
+          desc Something foo.
+          key foo
+          <labels>
+            path $.path
+          </labels>
+        </metric>
+      ]
+    }
+    let(:counter) { registry.get(:limited) }
+
+    def drop_logs
+      driver.logs.select { |log| log.include?('dropped a label set') }
+    end
+
+    it 'drops a new label set once the limit is reached' do
+      driver.run(default_tag: tag) do
+        driver.feed(event_time, {'foo' => 1, 'path' => '/a'})
+        driver.feed(event_time, {'foo' => 1, 'path' => '/b'})
+      end
+
+      expect(counter.values.keys).to eq([{path: '/a'}])
+      expect(drop_logs.size).to eq(1)
+    end
+
+    it 'keeps instrumenting a known label set after the limit is reached' do
+      driver.run(default_tag: tag) do
+        driver.feed(event_time, {'foo' => 1, 'path' => '/a'})
+        driver.feed(event_time, {'foo' => 1, 'path' => '/b'})
+        driver.feed(event_time, {'foo' => 1, 'path' => '/a'})
+      end
+
+      expect(counter.get(labels: {path: '/a'})).to eq(2)
+    end
+
+    it 'does not consume the limit by a label set which failed to be instrumented' do
+      driver.run(default_tag: tag) do
+        # a non numeric value makes Counter#increment raise, after the label set
+        # has been built
+        driver.feed(event_time, {'foo' => 'not a number', 'path' => '/a'})
+        driver.feed(event_time, {'foo' => 1, 'path' => '/b'})
+      end
+
+      expect(driver.error_events.size).to eq(1)
+      expect(counter.values.keys).to eq([{path: '/b'}])
+      expect(drop_logs).to be_empty
+    end
+  end
+
   describe 'label set limit log throttling' do
     let(:config) {
       BASE_CONFIG + %[
