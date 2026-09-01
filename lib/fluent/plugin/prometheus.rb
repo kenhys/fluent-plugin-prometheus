@@ -60,10 +60,12 @@ module Fluent
       # holding max_series_per_metric label sets of its own.
       class SeriesSet
         # The set is kept on the client metric, so that it is found again by
-        # every section and goes away with it. Metrics are built at
-        # configuration time, which is single threaded, so no lock is needed.
+        # every section. The registry does not drop its metrics, so the set is
+        # still there after a reload.
         IVAR = :@fluent_plugin_prometheus_series_set
 
+        # Sections are built at configuration time, which is single threaded,
+        # so this needs no lock.
         def self.of(client_metric)
           client_metric.instance_variable_get(IVAR) ||
             client_metric.instance_variable_set(IVAR, new)
@@ -74,8 +76,10 @@ module Fluent
           @mutex = Mutex.new
         end
 
-        def size
-          @mutex.synchronize { @series.size }
+        # Only <initlabels> come from the configuration. Counting a label set
+        # a record brought would refuse a good configuration after a reload.
+        def initial_size
+          @mutex.synchronize { @series.count { |_, state| state == :initial } }
         end
 
         # Checking the limit and taking the slot happen under the same lock, so
@@ -100,7 +104,19 @@ module Fluent
         # side already, so it has to be accounted for even when a concurrent
         # failure gave the reservation back in the meantime.
         def confirm(label)
-          @mutex.synchronize { @series[label] = :confirmed }
+          @mutex.synchronize do
+            # #initial_size has to keep counting it, so a record on it does not
+            # change where it came from
+            next if @series[label] == :initial
+
+            @series[label] = :confirmed
+          end
+        end
+
+        # The limit is not checked here either: a section which cannot hold
+        # these label sets is refused when the configuration is read.
+        def confirm_initial(label)
+          @mutex.synchronize { @series[label] = :initial }
         end
 
         # Gives a reserved slot back when the instrumentation failed, so that a
@@ -221,6 +237,14 @@ module Fluent
             raise ConfigError, "type option must be 'counter', 'gauge', 'summary' or 'histogram'"
           end
         }
+
+        # <metric> sections with the same name share one client
+        # metric. All of their <initlabels> label sets are known only
+        # after every section is built, so the check runs here and not
+        # in the constructor not to depend on the order of the
+        # sections.
+        metrics.each(&:check_series_limit!)
+
         metrics
       end
 
@@ -427,6 +451,22 @@ module Fluent
           metric
         end
 
+        # <initlabels> label sets go to the client as soon as the
+        # configuration is read. Every <metric> section with the same name
+        # shares them, so reject a section which has no room for the label
+        # sets.
+        def check_series_limit!
+          return if @max_series_per_metric <= 0
+          # two <initlabels> blocks with the same values make one label set
+          held = @series_set.initial_size
+          return if held <= @max_series_per_metric
+
+          raise ConfigError, "metric #{@name} already holds #{held} label sets from <initlabels>, " \
+                             "shared by every <metric> section with this name, " \
+                             "but max_series_per_metric is #{@max_series_per_metric} in this section: " \
+                             "the limit is already exceeded before any record arrives"
+        end
+
         private
 
         # The client refuses a value which is not a number, but it is only
@@ -455,28 +495,16 @@ module Fluent
         def bind_series_set(client_metric)
           @series_set = SeriesSet.of(client_metric)
 
-          if @initialized
-            # the client is given them at startup, so they take their slots now
-            @base_initlabels.each do |initlabels|
-              confirm_series(normalize_label_set(initlabels))
-            end
-            check_initlabels_fit_series_limit!
+          return unless @initialized
+
+          # The client gets them even when this section has no limit, so they
+          # take their slots in both cases. A section with the same name shares
+          # this set and has to see them. Their number is fixed by the
+          # configuration. Counting them cannot leak like the label sets that
+          # records bring.
+          @base_initlabels.each do |initlabels|
+            @series_set.confirm_initial(normalize_label_set(initlabels))
           end
-        end
-
-        # The client is given these label sets at startup, so a limit which
-        # does not fit them is already exceeded before any record arrives and
-        # the metric could never take a new one. Stop instead of running that
-        # way. A record on one of them is still counted, since the metric
-        # already holds its label set.
-        def check_initlabels_fit_series_limit!
-          return if @max_series_per_metric <= 0
-          # two <initlabels> blocks with the same values make one label set
-          return if @series_set.size <= @max_series_per_metric
-
-          raise ConfigError, "metric #{@name} holds #{@series_set.size} label sets from <initlabels>, " \
-                             "but max_series_per_metric is #{@max_series_per_metric}: " \
-                             "the limit is already exceeded before any record arrives"
         end
 
         # The SeriesSet keys a label set by its values, so the same value has to
@@ -494,8 +522,9 @@ module Fluent
         # Returns true when this call took the slot, which tells #with_label_set
         # whether it has something to give back on failure.
         def reserve_series!(label)
-          # nothing is counted with the limit off, otherwise the set would grow
-          # with every label set and leak what the limit is there to prevent
+          # If the limit is off, a label set from a record is not counted.
+          # If it is counted, the set grows with every new label set and
+          # uses too much memory.
           return false if @max_series_per_metric <= 0
 
           @series_set.reserve(label, @max_series_per_metric, @name)
